@@ -1,0 +1,17 @@
+corpus/
+_pycache_/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+results/
+*.log
+
+*.json
+*.csv
+*.jsonl
+*.jsonl.gz
+todo.txt
+instructions.md
