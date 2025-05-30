@@ -38,77 +38,60 @@ class OracleRetriever:
         
         return entities
     
-    def oracle_retrieve(self, question, qa_data, top_k=6):
-        """Oracle retrieval that guarantees required facts + realistic extras"""
-        
-        # Get required document IDs containing the facts
+    def oracle_retrieve(self, question, qa_data, top_k=6, verbose=False):
+        """Oracle retrieval with optional verbose output."""
         required_facts = qa_data['facts']
-        required_doc_ids = []
         
-        print(f"Looking for required facts: {required_facts}")
+        if verbose:
+            print(f"Looking for required facts: {required_facts}")
         
+        # Find documents containing required facts
+        required_docs = []
         for fact in required_facts:
-            found = False
             for doc_id, doc in enumerate(self.documents):
-                if fact in doc:
-                    if doc_id not in required_doc_ids:
-                        required_doc_ids.append(doc_id)
+                # Handle both string documents and dict documents
+                doc_content = doc if isinstance(doc, str) else doc.get('content', str(doc))
+                
+                if fact in doc_content:
+                    required_docs.append(doc_id)
+                    if verbose:
                         print(f"✅ Found '{fact}' in doc {doc_id}")
-                    found = True
                     break
-            
-            if not found:
-                print(f"❌ Could not find fact: '{fact}'")
         
-        # Add realistic distractors: documents containing question entities
-        question_entities = self.extract_entities_from_text(question)
-        distractor_docs = set()
+        # Get entity distractors (documents mentioning same entities)
+        entities_in_question = self.extract_entities_from_text(question)
+        entity_distractors = []
+        for doc_id, doc in enumerate(self.documents):
+            if doc_id not in required_docs:
+                doc_content = doc if isinstance(doc, str) else doc.get('content', str(doc))
+                if any(entity in doc_content for entity in entities_in_question):
+                    entity_distractors.append(doc_id)
+                    if len(entity_distractors) >= 2:
+                        break
         
-        for entity in question_entities:
-            if entity in self.entity_index:
-                distractor_docs.update(self.entity_index[entity])
+        # Get random distractors
+        all_used = set(required_docs + entity_distractors)
+        available_docs = [i for i in range(len(self.documents)) if i not in all_used]
+        random_distractors = random.sample(available_docs, min(3, len(available_docs)))
         
-        # Remove required docs from distractors
-        distractor_docs = [d for d in distractor_docs if d not in required_doc_ids]
+        # Combine all retrieved documents
+        retrieved_doc_ids = required_docs + entity_distractors + random_distractors
+        retrieved_doc_ids = retrieved_doc_ids[:top_k]  # Limit to top_k
         
-        # Calculate how many distractors we can add
-        remaining_slots = top_k - len(required_doc_ids)
+        # Get actual document content
+        retrieved_docs = []
+        for doc_id in retrieved_doc_ids:
+            doc = self.documents[doc_id]
+            doc_content = doc if isinstance(doc, str) else doc.get('content', str(doc))
+            retrieved_docs.append(doc_content)
         
-        if remaining_slots > 0:
-            # Add entity-related distractors first
-            entity_distractors = list(distractor_docs)[:min(2, remaining_slots)]
-            remaining_slots -= len(entity_distractors)
-            
-            # Add random distractors if we still have slots
-            random_distractors = []
-            if remaining_slots > 0:
-                all_doc_ids = list(range(len(self.documents)))
-                available_random = [d for d in all_doc_ids 
-                                  if d not in required_doc_ids and d not in distractor_docs]
-                random_distractors = random.sample(
-                    available_random,
-                    min(remaining_slots, len(available_random))
-                )
-            
-            # Combine all documents
-            final_doc_ids = required_doc_ids + entity_distractors + random_distractors
-        else:
-            # If we have too many required docs, just use required ones
-            final_doc_ids = required_doc_ids[:top_k]
-        
-        # Shuffle and ensure we don't exceed top_k
-        random.shuffle(final_doc_ids)
-        final_doc_ids = final_doc_ids[:top_k]
-        
-        retrieved_docs = [self.documents[doc_id] for doc_id in final_doc_ids]
-        
-        print(f"Oracle retrieved {len(final_doc_ids)} documents:")
-        print(f"  - {len(required_doc_ids)} required docs")
-        if remaining_slots > 0:
+        if verbose:
+            print(f"Oracle retrieved {len(retrieved_doc_ids)} documents:")
+            print(f"  - {len(required_docs)} required docs")
             print(f"  - {len(entity_distractors)} entity distractors") 
             print(f"  - {len(random_distractors)} random distractors")
         
-        return retrieved_docs, final_doc_ids
+        return retrieved_docs, retrieved_doc_ids
 
 class HybridRetriever:
     def __init__(self, documents, embedding_model='all-MiniLM-L6-v2'):

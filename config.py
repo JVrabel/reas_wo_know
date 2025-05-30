@@ -17,10 +17,20 @@ CONFIG = {
     
     # Training settings - MUCH MORE CONSERVATIVE
     "SEED": 42,
-    "BATCH_SIZE": 32,           # Smaller batch
-    "LEARNING_RATE": 1e-4,     # Much smaller LR
-    "TRAIN_STEPS": 50000,     # Fewer steps for now
-    "MODEL_DIM": 128,          # Smaller model
-    "MODEL_LAYERS": 2,         # Fewer layers
+    "BATCH_SIZE": 8,
+    "LEARNING_RATE": 1e-5,
+    "NUM_EPOCHS": 10,
+    "MODEL_DIM": 256,          # Smaller model
+    "MODEL_LAYERS": 8,         # Fewer layers
     "RETRIEVAL_K": 4,
+    
+    # Model architecture
+    "HIDDEN_SIZE": 1024,
+    "NUM_LAYERS": 6,
+    "NUM_HEADS": 8,
+    "MAX_LENGTH": 512,
+    
+    # Data
+    "TOP_K_DOCS": 3,
+    "MAX_FACTS_PER_DOC": 10,
 }

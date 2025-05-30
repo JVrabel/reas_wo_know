@@ -1,460 +1,586 @@
 import json
 import torch
 import torch.nn as nn
-import random
-import faiss
-import pickle
-import time
-import sys
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
+from torch.utils.data import DataLoader, Dataset
 import os
-from utils import build_alias, apply_alias, build_prompt
-from model import TinyDec, tok, device
+from tqdm import tqdm
+from datetime import datetime
+import glob
+import re
+
 from config import CONFIG
+from build_retriever import load_documents, OracleRetriever
+from utils import prepare_training_example
 
-print(f"[train_reasoner] Using device: {device}")
-
-# Initialize model
-model = TinyDec().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["LEARNING_RATE"])
-
-print(f"[train_reasoner] Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
-
-# Load QA data with reasoning chains
-print("[train_reasoner] Loading QA data...")
-try:
-    with open("corpus/qa.jsonl", "r") as f:
-        qa_raw = [json.loads(line.strip()) for line in f]
-    
-    # Keep the full QA data with reasoning chains
-    QA = []
-    for item in qa_raw:
-        if isinstance(item, list) and len(item) >= 3:
-            # Format: [question, answer, reasoning_chain]
-            question = item[0]
-            answer = item[1]
-            reasoning_chain = item[2] if len(item) > 2 else []
-            QA.append((question, answer, reasoning_chain))
-        else:
-            print(f"[WARNING] Unexpected QA format: {item}")
-            continue
-    
-    print(f"[train_reasoner] Loaded {len(QA)} QA pairs with reasoning chains")
-    
-    # Split QA for validation (use 10% for validation)
-    val_size = min(1000, len(QA) // 10)
-    val_qa = random.sample(QA, val_size)
-    train_qa = [qa for qa in QA if qa not in val_qa]
-    
-    print(f"[train_reasoner] Train: {len(train_qa)}, Validation: {len(val_qa)}")
-    
-    # Show a few examples
-    print("\n[DEBUG] Sample QA pairs:")
-    for i, (q, a, chain) in enumerate(QA[:2]):
-        print(f"  Q{i+1}: {q}")
-        print(f"  A{i+1}: {a}")
-        print(f"  Chain: {chain}")
-        print()
+class ReasoningDataset(Dataset):
+    def __init__(self, qa_data, retriever, tokenizer, max_length=512):
+        self.qa_data = qa_data
+        self.retriever = retriever
+        self.tokenizer = tokenizer
+        self.max_length = max_length
         
-except Exception as e:
-    print(f"[ERROR] Failed to load QA data: {e}")
-    sys.exit(1)
-
-# Validate tokenizer
-print("[train_reasoner] Testing tokenizer...")
-test_text = "What is the capital of France?"
-test_tokens = tok(test_text, return_tensors="pt")
-print(f"[DEBUG] Test tokenization: '{test_text}' → {test_tokens.input_ids.shape[1]} tokens")
-
-def evaluate_model(qa_sample, max_examples=100):
-    """Quick evaluation on a sample of QA pairs."""
-    model.eval()
-    correct = 0
-    total = 0
+    def __len__(self):
+        return len(self.qa_data)
     
-    eval_sample = random.sample(qa_sample, min(max_examples, len(qa_sample)))
-    
-    with torch.no_grad():
-        for q, a, reasoning_chain in eval_sample:
-            try:
-                # Build prompt using reasoning chain
-                if reasoning_chain and len(reasoning_chain) > 0:
-                    all_texts = [q, a] + reasoning_chain
-                    alias, inv_alias = build_alias(all_texts)
-                    prompt = build_prompt(q, reasoning_chain, alias)
-                    target = apply_alias(a, alias)
-                else:
-                    prompt = f"Question: {q}\nAnswer:"
-                    target = a
-                    inv_alias = {}
-                
-                # Tokenize prompt
-                input_ids = tok(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
-                
-                # Generate
-                output = model.generate(
-                    input_ids, 
-                    max_new_tokens=10,
-                    temperature=0.1,
-                    do_sample=False
-                )
-                
-                generated_text = tok.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
-                
-                # Apply inverse aliasing
-                for pseudo, real in inv_alias.items():
-                    generated_text = generated_text.replace(pseudo, real)
-                
-                # Extract entity (simple extraction)
-                pred = generated_text.strip().split()[0] if generated_text.strip() else ""
-                
-                if pred == a:
-                    correct += 1
-                total += 1
-                
-            except Exception as e:
-                # Skip problematic examples during evaluation
-                continue
-    
-    model.train()
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy, correct, total
+    def __getitem__(self, idx):
+        qa_example = self.qa_data[idx]
+        
+        # Retrieve documents using oracle retriever (silently)
+        retrieved_docs, _ = self.retriever.oracle_retrieve(
+            qa_example['question'], 
+            qa_example,
+            top_k=CONFIG["TOP_K_DOCS"],
+            verbose=False
+        )
+        
+        # Prepare training example with aliasing
+        training_example = prepare_training_example(qa_example, retrieved_docs)
+        
+        # Get the aliased target
+        target = training_example['target'].strip()
+        if not target:
+            # Fallback: use aliased answer directly
+            alias_map = training_example.get('alias_map', {})
+            target = alias_map.get(qa_example['answer'], qa_example['answer'])
+        
+        # Construct the full training sequence: prompt + answer
+        prompt = training_example['prompt'].rstrip()
+        
+        # Add reasoning section and answer
+        if not prompt.endswith('<REASON>'):
+            prompt = prompt + '\n<REASON>'
+        
+        # The full sequence should be: prompt + reasoning_marker + target + EOS
+        full_sequence = prompt + '\n' + target + self.tokenizer.eos_token
+        
+        # DEBUG: Print first few examples to see what's happening
+        if idx < 3:
+            print(f"\n=== DEBUG Training Example {idx} ===")
+            print(f"Target: '{target}'")
+            print(f"EOS token: '{self.tokenizer.eos_token}' (ID: {self.tokenizer.eos_token_id})")
+            print(f"Full sequence ends with: '{full_sequence[-20:]}'")
+            
+            # Check tokenization
+            target_with_eos = target + self.tokenizer.eos_token
+            target_tokens = self.tokenizer.encode(target_with_eos, add_special_tokens=False)
+            print(f"Target + EOS tokens: {target_tokens}")
+            print(f"Decoded back: '{self.tokenizer.decode(target_tokens)}'")
+            print()
+        
+        # Tokenize the full sequence
+        full_tokens = self.tokenizer.encode(full_sequence, add_special_tokens=False)
+        
+        # Find where the target starts by tokenizing prompt separately
+        prompt_tokens = self.tokenizer.encode(prompt + '\n', add_special_tokens=False)
+        prompt_length = len(prompt_tokens)
+        
+        # CRITICAL: Filter out invalid token IDs
+        vocab_size = len(self.tokenizer)
+        full_tokens = [t for t in full_tokens if 0 <= t < vocab_size]
+        
+        # CRITICAL: Ensure EOS token is always present at the end
+        if len(full_tokens) == 0 or full_tokens[-1] != self.tokenizer.eos_token_id:
+            full_tokens.append(self.tokenizer.eos_token_id)
+        
+        # Ensure we have some target tokens (including EOS)
+        if len(full_tokens) <= prompt_length:
+            # Add a safe fallback target + EOS
+            target_fallback = self.tokenizer.encode(" unknown", add_special_tokens=False)
+            target_fallback = [t for t in target_fallback if 0 <= t < vocab_size]
+            full_tokens.extend(target_fallback)
+            full_tokens.append(self.tokenizer.eos_token_id)
+        
+        # REMOVE ALL TRUNCATION - just pad to max_length
+        # If sequence is longer than max_length, that's a data problem, not a truncation problem
+        if len(full_tokens) > self.max_length:
+            print(f"WARNING: Sequence too long ({len(full_tokens)} > {self.max_length}), skipping example")
+            # Return a dummy example or handle gracefully
+            full_tokens = full_tokens[:self.max_length-1] + [self.tokenizer.eos_token_id]
+        
+        # Pad to max_length
+        input_ids = full_tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(full_tokens))
+        input_ids = input_ids[:self.max_length]
+        
+        # Create labels: -100 for prompt tokens, actual tokens for target
+        labels = [-100] * len(input_ids)
+        
+        # Find actual prompt length in the truncated sequence
+        actual_prompt_tokens = self.tokenizer.encode(prompt + '\n', add_special_tokens=False)
+        actual_prompt_tokens = [t for t in actual_prompt_tokens if 0 <= t < vocab_size]
+        actual_prompt_length = min(len(actual_prompt_tokens), len(input_ids))
+        
+        # Set labels for target tokens only
+        for i in range(actual_prompt_length, len(input_ids)):
+            if input_ids[i] != self.tokenizer.pad_token_id:
+                labels[i] = input_ids[i]
+        
+        # NEW DEBUG: Check if EOS is in labels
+        if idx < 3:
+            target_labels = [labels[i] for i in range(len(labels)) if labels[i] != -100]
+            print(f"Target labels: {target_labels}")
+            print(f"EOS in target labels: {self.tokenizer.eos_token_id in target_labels}")
+            print(f"Last target label: {target_labels[-1] if target_labels else 'None'}")
+        
+        # Create attention mask
+        attention_mask = [1 if token_id != self.tokenizer.pad_token_id else 0 for token_id in input_ids]
+        
+        return {
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'labels': torch.tensor(labels, dtype=torch.long),
+            'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
+            'qa_example': qa_example,
+            'training_example': training_example
+        }
 
-def save_checkpoint(step, loss, val_accuracy, is_best=False):
-    """Save model checkpoint with cleanup of old checkpoints."""
-    checkpoint = {
-        'step': step,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-        'val_accuracy': val_accuracy,
-        'config': CONFIG
+def custom_collate_fn(batch):
+    """Custom collate function to handle the batch properly."""
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    qa_examples = [item['qa_example'] for item in batch]
+    training_examples = [item['training_example'] for item in batch]
+    
+    return {
+        'input_ids': input_ids,
+        'labels': labels,
+        'attention_mask': attention_mask,
+        'qa_example': qa_examples,
+        'training_example': training_examples
+    }
+
+def setup_tokenizer():
+    """Setup tokenizer with special tokens."""
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    
+    # DON'T set pad_token = eos_token!
+    # Add a proper pad token instead
+    special_tokens = ['<PAD>', '<Q>', '<DOC_1>', '<DOC_2>', '<DOC_3>', '<DOC_4>', '<DOC_5>', '<DOC_6>', '<REASON>']
+    
+    # Add entity tokens
+    entity_pools = {
+        'PERSON': 10, 'COMPANY': 10, 'LOCATION': 10, 'SKILL': 10,
+        'PROJECT': 5, 'TECHNOLOGY': 5, 'DATE': 5
     }
     
-    # Save regular checkpoint
-    checkpoint_path = f"corpus/checkpoint_step_{step}.pt"
-    torch.save(checkpoint, checkpoint_path)
+    for entity_type, count in entity_pools.items():
+        for i in range(1, count + 1):
+            special_tokens.append(f'<{entity_type}{i:02d}>')
     
-    # Clean up old checkpoints (keep only last 3)
-    cleanup_old_checkpoints(keep_last=3)
+    # Add all tokens to tokenizer
+    tokenizer.add_tokens(special_tokens)
     
-    # Save best model
-    if is_best:
-        best_path = "corpus/tiny_reasoner.pt"
-        torch.save(checkpoint, best_path)
-        print(f"[CHECKPOINT] New best model saved! Val accuracy: {val_accuracy:.3f}")
+    # Set pad token to our custom pad token
+    tokenizer.pad_token = '<PAD>'
     
-    print(f"[CHECKPOINT] Saved checkpoint at step {step}")
-    return checkpoint_path
+    print(f"EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
+    print(f"PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
+    
+    return tokenizer
 
-def cleanup_old_checkpoints(keep_last=3):
-    """Remove old checkpoint files, keeping only the most recent ones."""
-    import glob
-    import os
+def setup_model(tokenizer):
+    """Setup model with proper configuration."""
+    config = GPT2Config(
+        vocab_size=len(tokenizer),
+        n_positions=CONFIG["MAX_LENGTH"],
+        n_embd=CONFIG["HIDDEN_SIZE"],
+        n_layer=CONFIG["NUM_LAYERS"],
+        n_head=CONFIG["NUM_HEADS"],
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+    )
     
-    # Find all checkpoint files
-    checkpoint_files = glob.glob("corpus/checkpoint_step_*.pt")
+    model = GPT2LMHeadModel(config)
     
-    if len(checkpoint_files) <= keep_last:
-        return  # Nothing to clean up
+    # Resize token embeddings to match tokenizer
+    model.resize_token_embeddings(len(tokenizer))
     
-    # Sort by step number (extract step from filename)
-    checkpoint_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-    
-    # Remove old files (keep only the last N)
-    files_to_remove = checkpoint_files[:-keep_last]
-    
-    for file_path in files_to_remove:
-        try:
-            os.remove(file_path)
-            step_num = file_path.split('_')[-1].split('.')[0]
-            print(f"[CLEANUP] Removed old checkpoint: step_{step_num}")
-        except Exception as e:
-            print(f"[WARNING] Could not remove {file_path}: {e}")
+    return model
 
-# Training setup
-print("[train_reasoner] Starting training...")
-print("=" * 60)
-model.train()
-start_time = time.time()
-
-# Track statistics
-total_examples = 0
-skipped_examples = 0
-nan_losses = 0
-best_val_accuracy = 0.0
-eval_interval = 5000  # Evaluate every 5k steps
-save_interval = 5000  # Save checkpoint every 5k steps
-
-# Load existing checkpoint if available
-checkpoint_path = "corpus/tiny_reasoner.pt"
-start_step = 0
-if os.path.exists(checkpoint_path):
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_step = checkpoint.get('step', 0)
-        best_val_accuracy = checkpoint.get('val_accuracy', 0.0)
-        print(f"[train_reasoner] Resumed from step {start_step}, best val accuracy: {best_val_accuracy:.3f}")
-    except Exception as e:
-        print(f"[WARNING] Could not load checkpoint: {e}")
-
-for step in range(start_step, CONFIG["TRAIN_STEPS"]):
-    try:
-        # Sample batch
-        batch = random.sample(train_qa, CONFIG["BATCH_SIZE"])
+def validate_batch(batch, tokenizer, batch_name=""):
+    """Validate a batch for debugging."""
+    print(f"Validating {batch_name} batch...")
+    
+    input_ids = batch['input_ids']
+    labels = batch['labels']
+    attention_mask = batch['attention_mask']
+    
+    vocab_size = len(tokenizer)
+    
+    # Check for invalid token IDs
+    invalid_input = torch.any(input_ids >= vocab_size)
+    invalid_labels = torch.any((labels >= vocab_size) & (labels != -100))
+    
+    if invalid_input:
+        print(f"❌ Invalid input token IDs found!")
+        return False
+    
+    if invalid_labels:
+        print(f"❌ Invalid label token IDs found!")
+        return False
+    
+    # Check if we have valid labels
+    valid_label_indices = torch.where(labels[0] != -100)[0]
+    
+    if len(valid_label_indices) > 0:
+        first_label_idx = valid_label_indices[0].item()
+        last_label_idx = valid_label_indices[-1].item()
         
-        total_loss = 0
-        valid_examples = 0
+        prompt_part = tokenizer.decode(input_ids[0][:first_label_idx], skip_special_tokens=False)
+        target_part = tokenizer.decode(input_ids[0][first_label_idx:last_label_idx+1], skip_special_tokens=False)
         
-        for q, a, reasoning_chain in batch:
+        print(f"Prompt part ends with: ...{prompt_part[-50:]}")
+        print(f"Target part: '{target_part}'")
+        print(f"Valid labels count: {len(valid_label_indices)}")
+        
+        return True
+    else:
+        print("❌ No valid labels found!")
+        return False
+
+def generate_sample_predictions(model, tokenizer, batch, device, max_new_tokens=10, num_samples=10):
+    """Generate sample predictions using the aliased data."""
+    model.eval()
+    samples = []
+    correct_predictions = 0
+    
+    with torch.no_grad():
+        # Generate more samples (up to batch size or num_samples)
+        actual_samples = min(num_samples, len(batch['qa_example']))
+        
+        for i in range(actual_samples):
+            qa_example = batch['qa_example'][i]
+            training_example = batch['training_example'][i]
+            
+            # Get the aliased prompt (everything before target)
+            input_ids = batch['input_ids'][i].to(device)
+            labels = batch['labels'][i]
+            
+            # Find where the target starts (first non -100 label)
+            valid_label_indices = torch.where(labels != -100)[0]
+            if len(valid_label_indices) == 0:
+                continue
+                
+            prompt_length = valid_label_indices[0].item()
+            prompt_ids = input_ids[:prompt_length].unsqueeze(0)
+            
+            # Generate with proper EOS stopping
+            generated = model.generate(
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                early_stopping=True,
+            )
+            
+            # DEBUG: Check what was actually generated
+            generated_tokens = generated[0][prompt_length:]
+            print(f"Generated token IDs: {generated_tokens.tolist()}")
+            print(f"EOS token ID: {tokenizer.eos_token_id}")
+            print(f"Contains EOS: {tokenizer.eos_token_id in generated_tokens}")
+            
+            # Decode and stop at EOS manually if needed
+            generated_tokens = generated_tokens[:len(generated_tokens) - 1]
+            
+            # Find EOS token and truncate there
+            if tokenizer.eos_token_id in generated_tokens:
+                eos_pos = (generated_tokens == tokenizer.eos_token_id).nonzero(as_tuple=True)[0][0]
+                generated_tokens = generated_tokens[:eos_pos]
+            
+            generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+            
+            # Get the expected aliased target
+            expected_aliased = training_example['target']
+            
+            # Get alias map to convert back
+            alias_map = training_example.get('alias_map', {})
+            reverse_alias_map = {v: k for k, v in alias_map.items()}
+            
+            # Convert ALL aliases back to original format
+            predicted_real = generated_text.strip()
+            for alias, original in reverse_alias_map.items():
+                predicted_real = predicted_real.replace(alias, original)
+            
+            # Extract aliased question from training example
+            aliased_prompt = training_example['prompt']
+            aliased_question = aliased_prompt.split('\n')[0].replace('<Q> ', '').strip()
+            
+            print(f"=== Sample {i+1} ===")
+            print(f"Model saw (aliased): {aliased_question}")
+            print(f"Model generated (aliased): '{generated_text.strip()}'")
+            print(f"Expected (aliased): '{expected_aliased}'")
+            print(f"---")
+            print(f"Original question: {qa_example['question']}")
+            print(f"Predicted (real): '{predicted_real}'")
+            print(f"Gold answer (real): '{qa_example['answer']}'")
+            print()
+            
+            # Extract retrieved documents from training example
+            retrieved_docs = []
+            prompt_lines = training_example['prompt'].split('\n')
+            for line in prompt_lines:
+                if line.startswith('<DOC_'):
+                    # Remove the <DOC_X> prefix and clean up
+                    doc_content = line.split('> ', 1)[-1] if '> ' in line else line
+                    retrieved_docs.append(doc_content.strip())
+            
+            # Check if prediction is correct
+            is_correct = (predicted_real == qa_example['answer'])
+            if is_correct:
+                correct_predictions += 1
+            
+            samples.append({
+                'question': qa_example['question'],
+                'aliased_question': aliased_question,
+                'gold_answer': qa_example['answer'],
+                'expected_aliased': expected_aliased,
+                'prediction': predicted_real,
+                'prediction_aliased': generated_text.strip(),
+                'reasoning_type': qa_example.get('reasoning_type', 'unknown'),
+                'retrieved_docs': retrieved_docs,
+                'full_prompt': training_example['prompt'],
+                'is_correct': is_correct  # Add correctness flag
+            })
+    
+    # Calculate accuracy
+    accuracy = correct_predictions / actual_samples if actual_samples > 0 else 0.0
+    
+    model.train()
+    return samples, accuracy
+
+def cleanup_old_checkpoints(models_dir, max_checkpoints=2):
+    """Keep only the most recent checkpoints."""
+    checkpoint_files = glob.glob(os.path.join(models_dir, "reasoner_epoch_*.pt"))
+    if len(checkpoint_files) > max_checkpoints:
+        # Sort by modification time
+        checkpoint_files.sort(key=os.path.getmtime)
+        # Remove oldest files
+        for old_file in checkpoint_files[:-max_checkpoints]:
             try:
-                # USE ALIASING - This is the key fix!
-                aliased_q, aliased_chain, aliased_a, alias, inv_alias = create_training_example_with_aliasing(q, reasoning_chain, a)
-                
-                # Build prompt with aliased entities
-                if aliased_chain and len(aliased_chain) > 0:
-                    prompt = f"<Q> {aliased_q}\n"
-                    for i, sent in enumerate(aliased_chain):
-                        prompt += f"<DOC_{i+1}> {sent}\n"
-                    prompt += "<REASON>"
-                    target = aliased_a
-                else:
-                    prompt = f"Question: {aliased_q}\nAnswer:"
-                    target = aliased_a
-                
-                # Create full text with proper format
-                full_text = prompt + " " + target + tok.eos_token
-                
-                # DEBUG: Print first few examples
-                if step < 3 and valid_examples == 0:
-                    print(f"\n[DEBUG] Step {step}, Example {valid_examples}:")
-                    print(f"  Question: {q}")
-                    print(f"  Answer: {a}")
-                    print(f"  Target: {target}")
-                    print(f"  Prompt: {prompt}")
-                    print(f"  Full text: {full_text}")
-                
-                # Tokenize
-                full_ids = tok(full_text, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
-                prompt_ids = tok(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
-                
-                if full_ids.size(1) <= prompt_ids.size(1):
-                    continue
-                
-                prompt_len = prompt_ids.size(1)
-                
-                # Create labels
-                labels = full_ids.clone()
-                labels[:, :prompt_len] = -100  # Ignore prompt tokens
-                
-                # DEBUG: Check if we have valid labels
-                valid_label_count = (labels != -100).sum().item()
-                if valid_label_count == 0:
-                    print(f"[DEBUG] No valid labels! prompt_len: {prompt_len}, full_len: {full_ids.size(1)}")
-                    continue
-                
-                # DEBUG: Print first few examples
-                if step < 3 and valid_examples == 0:
-                    print(f"\n[DEBUG] Step {step}, Example {valid_examples}:")
-                    print(f"  Question: {q}")
-                    print(f"  Answer: {a}")
-                    print(f"  Target: {target}")
-                    print(f"  Prompt length: {prompt_len}")
-                    print(f"  Full length: {full_ids.size(1)}")
-                    print(f"  Valid labels: {valid_label_count}")
-                    print(f"  Labels: {labels[0, prompt_len:prompt_len+5]}")  # Show first few target labels
-                
-                # Forward pass
-                loss, _ = model(full_ids, labels=labels)
-                
-                # DEBUG: Check loss value
-                if step < 3 and valid_examples == 0:
-                    print(f"  Raw loss: {loss}")
-                    print(f"  Loss item: {loss.item()}")
-                
-                if torch.isnan(loss):
-                    nan_losses += 1
-                    if nan_losses > 10:
-                        print("[ERROR] Too many NaN losses, stopping training")
-                        sys.exit(1)
-                    continue
-                
-                # Accumulate loss
-                total_loss += loss
-                valid_examples += 1
-                total_examples += 1
-                
+                os.remove(old_file)
+                print(f"Removed old checkpoint: {old_file}")
             except Exception as e:
-                print(f"[ERROR] Exception in example: {e}")
-                skipped_examples += 1
-                continue
-        
-        # Backward pass
-        if valid_examples > 0:
-            avg_loss = total_loss / valid_examples
+                print(f"Failed to remove {old_file}: {e}")
+
+def train_model():
+    """Main training function with aliasing."""
+    print("[train_reasoner] Setting up training...")
+    
+    # Create timestamped results folder
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = f"results/training_{timestamp}"
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs("models", exist_ok=True)
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Load data
+    print("Loading data...")
+    try:
+        with open("corpus/qa_train.jsonl", "r") as f:
+            qa_data = [json.loads(line.strip()) for line in f]
+        documents = load_documents("corpus/docs_train.jsonl")
+        print(f"Loaded {len(qa_data)} QA examples, {len(documents)} documents")
+    except Exception as e:
+        print(f"[ERROR] Failed to load data: {e}")
+        return
+
+    # Initialize components
+    print("Initializing model and tokenizer...")
+    retriever = OracleRetriever(documents)
+    tokenizer = setup_tokenizer()
+    model = setup_model(tokenizer).to(device)
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=CONFIG["LEARNING_RATE"],
+        weight_decay=0.01,
+        eps=1e-8,
+        betas=(0.9, 0.999)
+    )
+    
+    print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
+    print(f"Vocabulary: {len(tokenizer)} tokens")
+    
+    # Create dataset
+    dataset = ReasoningDataset(qa_data, retriever, tokenizer, CONFIG["MAX_LENGTH"])
+    
+    # Create dataloader
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=CONFIG["BATCH_SIZE"], 
+        shuffle=True,
+        collate_fn=custom_collate_fn
+    )
+    
+    # Calculate training info
+    steps_per_epoch = len(dataloader)
+    total_steps = CONFIG["NUM_EPOCHS"] * steps_per_epoch
+    
+    print(f"Dataset size: {len(dataset)}")
+    print(f"Batch size: {CONFIG['BATCH_SIZE']}")
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Training for {CONFIG['NUM_EPOCHS']} epochs = {total_steps} total steps")
+    print(f"Results will be saved to: {results_dir}")
+    
+    # Validate first batch before training
+    print("\n🔍 Validating data before training...")
+    first_batch = next(iter(dataloader))
+    if not validate_batch(first_batch, tokenizer, "First"):
+        print("❌ Data validation failed! Stopping training.")
+        return
+    
+    # Test forward pass with first batch
+    print("🔍 Testing forward pass...")
+    model.eval()
+    with torch.no_grad():
+        try:
+            input_ids = first_batch['input_ids'].to(device)
+            labels = first_batch['labels'].to(device)
+            attention_mask = first_batch['attention_mask'].to(device)
             
-            # DEBUG: Check average loss
-            if step < 3:
-                print(f"[DEBUG] Step {step}: total_loss={total_loss}, valid_examples={valid_examples}, avg_loss={avg_loss}")
+            outputs = model(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
+            loss = outputs.loss
             
-            optimizer.zero_grad()
-            avg_loss.backward()
-            
-            # Check gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if torch.isnan(grad_norm):
-                print(f"[ERROR] NaN gradients at step {step}")
-                continue
-            
-            # DEBUG: Check gradient norm
-            if step < 3:
-                print(f"[DEBUG] Step {step}: grad_norm={grad_norm}")
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"❌ Forward pass produces invalid loss: {loss.item()}")
+                return
+            else:
+                print(f"✅ Forward pass successful, loss: {loss.item():.4f}")
                 
+        except Exception as e:
+            print(f"❌ Forward pass failed: {e}")
+            return
+    
+    # Training loop
+    print("\n🚀 Starting training...")
+    model.train()
+    step = 0
+    
+    # Initialize training progress tracking
+    training_progress = []
+    
+    for epoch in range(CONFIG["NUM_EPOCHS"]):
+        # Create progress bar
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{CONFIG['NUM_EPOCHS']}")
+        
+        for batch in pbar:
+            step += 1
+            
+            # Move batch to device
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            # Validate token IDs
+            vocab_size = len(tokenizer)
+            input_ids = torch.clamp(input_ids, 0, vocab_size - 1)
+            valid_label_mask = (labels != -100)
+            labels = torch.where(valid_label_mask, 
+                               torch.clamp(labels, 0, vocab_size - 1), 
+                               labels)
+            
+            # Forward pass
+            outputs = model(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
+            loss = outputs.loss
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            # Evaluation and checkpointing
-            if (step + 1) % eval_interval == 0:
-                print(f"\n[EVALUATION] Step {step + 1}")
-                val_accuracy, val_correct, val_total = evaluate_model(val_qa, max_examples=200)
-                print(f"[EVALUATION] Validation accuracy: {val_accuracy:.3f} ({val_correct}/{val_total})")
-                
-                # Save checkpoint if better
-                is_best = val_accuracy > best_val_accuracy
-                if is_best:
-                    best_val_accuracy = val_accuracy
-                
-                save_checkpoint(step + 1, avg_loss.item(), val_accuracy, is_best)
-                
-                # Early stopping check
-                if val_accuracy > 0.9:
-                    print(f"[EARLY STOP] High validation accuracy reached: {val_accuracy:.3f}")
-                    break
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'step': f'{step}/{total_steps}'})
             
-            # Regular checkpoint saving
-            elif (step + 1) % save_interval == 0:
-                save_checkpoint(step + 1, avg_loss.item(), best_val_accuracy, is_best=False)
-            
-            # Progress reporting
-            if step % 50 == 0:
-                elapsed = time.time() - start_time
-                steps_per_sec = (step + 1 - start_step) / elapsed if elapsed > 0 else 0
-                eta_seconds = (CONFIG["TRAIN_STEPS"] - step - 1) / steps_per_sec if steps_per_sec > 0 else 0
-                eta_mins = eta_seconds / 60
+            # Log progress every 100 steps
+            if step % 100 == 0:
+                print(f"\nStep {step}/{total_steps}: Loss = {loss.item():.4f}")
                 
-                success_rate = (total_examples / (total_examples + skipped_examples)) * 100 if (total_examples + skipped_examples) > 0 else 0
+                # Save training progress
+                progress_entry = {
+                    'step': step,
+                    'epoch': epoch + 1,
+                    'loss': loss.item(),
+                    'timestamp': datetime.now().isoformat()
+                }
+                training_progress.append(progress_entry)
                 
-                print(f"Step {step:5d}/{CONFIG['TRAIN_STEPS']} | Loss: {avg_loss.item():.4f} | "
-                      f"Valid: {valid_examples}/{CONFIG['BATCH_SIZE']} | "
-                      f"Success: {success_rate:.1f}% | Best Val: {best_val_accuracy:.3f} | "
-                      f"Speed: {steps_per_sec:.1f} steps/s | ETA: {eta_mins:.1f}m")
-                sys.stdout.flush()
-        else:
-            print(f"[WARNING] No valid examples in batch at step {step}")
+                # Save progress to file
+                progress_file = os.path.join(results_dir, "training_progress.json")
+                with open(progress_file, 'w') as f:
+                    json.dump(training_progress, f, indent=2)
             
-    except Exception as e:
-        print(f"[ERROR] Exception in training step {step}: {e}")
-        continue
+            # Generate sample predictions every 200 steps
+            if step % 200 == 0:
+                print(f"\n=== Step {step} Sample Predictions ===")
+                try:
+                    samples, accuracy = generate_sample_predictions(model, tokenizer, batch, device, num_samples=10)
+                    
+                    # Save samples to file with accuracy
+                    sample_data = {
+                        'step': step,
+                        'accuracy': accuracy,
+                        'correct_predictions': sum(1 for s in samples if s['is_correct']),
+                        'total_samples': len(samples),
+                        'samples': samples
+                    }
+                    
+                    sample_file = os.path.join(results_dir, f"samples_step_{step}.json")
+                    with open(sample_file, 'w') as f:
+                        json.dump(sample_data, f, indent=2)
+                    
+                    # Print accuracy and a few samples
+                    print(f"Accuracy: {accuracy:.2%} ({sum(1 for s in samples if s['is_correct'])}/{len(samples)})")
+                    
+                    for i, sample in enumerate(samples[:3]):  # Show first 3
+                        status = "✅" if sample['is_correct'] else "❌"
+                        print(f"Sample {i+1} {status}:")
+                        print(f"  Q: {sample['question']}")
+                        print(f"  Gold: {sample['gold_answer']}")
+                        print(f"  Pred: {sample['prediction']}")
+                        print(f"  Type: {sample['reasoning_type']}")
+                        print()
+                    
+                except Exception as e:
+                    print(f"❌ Sample generation failed: {e}")
+                    print("Continuing training without samples...")
+            
+            # Save checkpoint every epoch
+            if step % steps_per_epoch == 0:
+                try:
+                    checkpoint_path = f"models/reasoner_epoch_{epoch+1}.pt"
+                    model_cpu = model.cpu()
+                    torch.save({
+                        'model_state_dict': model_cpu.state_dict(),
+                        'tokenizer': tokenizer,
+                        'step': step,
+                        'config': CONFIG
+                    }, checkpoint_path)
+                    model = model.to(device)
+                    print(f"Saved checkpoint: {checkpoint_path}")
+                    
+                    cleanup_old_checkpoints("models", max_checkpoints=2)
+                except Exception as e:
+                    print(f"Failed to save checkpoint: {e}")
 
-# Final evaluation and save
-print(f"\n[train_reasoner] Training completed")
-print(f"[STATS] Total examples: {total_examples}, Skipped: {skipped_examples}, NaN losses: {nan_losses}")
+    # Save final model
+    final_path = "models/reasoner_final.pt"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'tokenizer': tokenizer,
+        'step': step,
+        'config': CONFIG
+    }, final_path)
+    
+    print(f"\nTraining completed! Final model saved: {final_path}")
+    print(f"Results saved to: {results_dir}")
+    print(f"Training progress saved to: {os.path.join(results_dir, 'training_progress.json')}")
 
-# Final validation
-final_val_accuracy, final_correct, final_total = evaluate_model(val_qa, max_examples=500)
-print(f"[FINAL] Validation accuracy: {final_val_accuracy:.3f} ({final_correct}/{final_total})")
-
-# At the end of training, always save as best model
-print("[train_reasoner] Saving final model as best model...")
-torch.save({
-    'step': CONFIG["TRAIN_STEPS"],
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'loss': 0.0,
-    'val_accuracy': final_val_accuracy,
-    'config': CONFIG
-}, "corpus/tiny_reasoner.pt")
-
-print("[train_reasoner] Training complete!")
-
-def scramble_entity_ids(question, reasoning_chain, answer):
-    """Replace entity IDs with random ones to prevent memorization."""
-    import re
-    
-    # Find all unique entity IDs in the example
-    all_text = question + " " + " ".join(reasoning_chain) + " " + answer
-    entity_pattern = r'([PLC]\d+)'
-    entities = list(set(re.findall(entity_pattern, all_text)))
-    
-    # Create random replacements
-    entity_mapping = {}
-    for entity in entities:
-        entity_type = entity[0]
-        if entity_type == 'P':
-            new_id = f"P{random.randint(10000, 99999)}"
-        elif entity_type == 'L':
-            new_id = f"L{random.randint(10000, 99999)}"
-        elif entity_type == 'C':
-            new_id = f"C{random.randint(10000, 99999)}"
-        entity_mapping[entity] = new_id
-    
-    # Apply scrambling
-    scrambled_question = question
-    scrambled_chain = reasoning_chain.copy()
-    scrambled_answer = answer
-    
-    for old_id, new_id in entity_mapping.items():
-        scrambled_question = scrambled_question.replace(old_id, new_id)
-        scrambled_chain = [sent.replace(old_id, new_id) for sent in scrambled_chain]
-        scrambled_answer = scrambled_answer.replace(old_id, new_id)
-    
-    return scrambled_question, scrambled_chain, scrambled_answer
-
-def prepare_training_data_with_scrambling():
-    """Prepare training data with entity scrambling and masking."""
-    print("[train_reasoner] Loading and preparing training data with scrambling...")
-    
-    with open("corpus/qa.jsonl", "r") as f:
-        qa_raw = [json.loads(line.strip()) for line in f]
-    
-    training_data = []
-    
-    for item in qa_raw:
-        q, a, reasoning_chain = item[0], item[1], item[2]
-        
-        # 50% scrambled entity IDs
-        if random.random() < 0.5:
-            scrambled_q, scrambled_chain, scrambled_a = scramble_entity_ids(q, reasoning_chain, a)
-            prompt = build_prompt(scrambled_q, scrambled_chain, scrambled_a)
-        
-        # 50% generic masking
-        else:
-            from train_reasoner_masked import create_masked_training_example
-            masked_q, masked_chain, masked_a, _ = create_masked_training_example(q, reasoning_chain, a)
-            prompt = build_prompt(masked_q, masked_chain, masked_a)
-        
-        training_data.append(prompt)
-    
-    print(f"[train_reasoner] Created {len(training_data)} training examples with scrambling")
-    return training_data
-
-def create_training_example_with_aliasing(question, reasoning_chain, answer):
-    """Create training example with proper entity aliasing."""
-    # Combine all text to find entities
-    all_texts = [question, answer] + reasoning_chain
-    
-    # Build aliases
-    alias, inv_alias = build_alias(all_texts)
-    
-    # Apply aliasing
-    aliased_question = apply_alias(question, alias)
-    aliased_chain = [apply_alias(sent, alias) for sent in reasoning_chain]
-    aliased_answer = apply_alias(answer, alias)
-    
-    return aliased_question, aliased_chain, aliased_answer, alias, inv_alias
-
-def apply_aliases(text, alias_map):
-    """Replace entity IDs with aliases."""
-    for entity_id, alias in alias_map.items():
-        text = text.replace(entity_id, alias)
-    return text
+if __name__ == "__main__":
+    train_model()
