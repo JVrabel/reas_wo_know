@@ -31,7 +31,9 @@ def validate_no_shortcuts(chain, all_facts):
     """Ensure a reasoning chain has no shorter paths to the answer"""
     question_type = chain['reasoning_type']
     
-    if question_type == '3-hop':
+    if question_type == '4-hop':
+        return validate_4hop_no_shortcuts(chain, all_facts)
+    elif question_type == '3-hop':
         return validate_3hop_no_shortcuts(chain, all_facts)
     elif question_type == '2-hop':
         return validate_2hop_no_shortcuts(chain, all_facts)
@@ -127,6 +129,115 @@ def validate_2hop_no_shortcuts(chain, all_facts):
     
     return True
 
+def validate_4hop_no_shortcuts(chain, all_facts):
+    """Validate 4-hop question has no 1-hop, 2-hop, or 3-hop shortcuts"""
+    
+    if "What skill is needed for" in chain['question'] and "'s colleague's company's project" in chain['question']:
+        # Extract person from "What skill is needed for P001's colleague's company's project?"
+        person = chain['question'].split("What skill is needed for ")[1].split("'s colleague's company's project?")[0]
+        answer = chain['answer']
+        
+        # Find intermediate entities from the chain facts
+        colleague = None
+        company = None
+        project = None
+        
+        for fact in chain['facts']:
+            if "works with" in fact:
+                colleague = fact.split(" works with ")[1]
+            elif "works at" in fact:
+                company = fact.split(" works at ")[1]
+            elif "manages" in fact:
+                project = fact.split(" manages ")[1]
+        
+        # Check for 1-hop shortcut: person directly has the skill
+        for fact in all_facts:
+            if (f"{person} is skilled in {answer}" in fact or 
+                f"{person} has skill {answer}" in fact):
+                return False
+        
+        # Check for 2-hop shortcuts: person works at company or on project directly
+        if company:
+            for fact in all_facts:
+                if (f"{person} works at {company}" in fact):
+                    return False
+        if project:
+            for fact in all_facts:
+                if (f"{person} works on {project}" in fact):
+                    return False
+        
+        # Check for 3-hop shortcut: person's company's project directly
+        if colleague:
+            for fact in all_facts:
+                if (f"{person} works at" in fact and company and 
+                    f"{company} manages {project}" in ' '.join(all_facts)):
+                    return False
+    
+    elif "Where is" in chain['question'] and "'s manager's company's project located" in chain['question']:
+        person = chain['question'].split("Where is ")[1].split("'s manager's company's project located?")[0]
+        answer = chain['answer']
+        
+        # Find intermediate entities
+        manager = None
+        company = None
+        project = None
+        
+        for fact in chain['facts']:
+            if "reports to" in fact:
+                manager = fact.split(" reports to ")[1]
+            elif "works at" in fact:
+                company = fact.split(" works at ")[1]
+            elif "manages" in fact:
+                project = fact.split(" manages ")[1]
+        
+        # Check for 1-hop shortcut: person lives in that location
+        for fact in all_facts:
+            if (f"{person} lives in {answer}" in fact or 
+                f"{person} resides in {answer}" in fact):
+                return False
+        
+        # Check for 2-hop and 3-hop shortcuts
+        if company:
+            for fact in all_facts:
+                if (f"{person} works at {company}" in fact):
+                    return False
+        if project:
+            for fact in all_facts:
+                if (f"{person} works on {project}" in fact):
+                    return False
+    
+    elif "What technology is used in" in chain['question'] and "'s company's partner's project" in chain['question']:
+        person = chain['question'].split("What technology is used in ")[1].split("'s company's partner's project?")[0]
+        answer = chain['answer']
+        
+        # Find intermediate entities
+        company = None
+        partner = None
+        project = None
+        
+        for fact in chain['facts']:
+            if "works at" in fact:
+                company = fact.split(" works at ")[1]
+            elif "partners with" in fact:
+                partner = fact.split(" partners with ")[1]
+            elif "manages" in fact:
+                project = fact.split(" manages ")[1]
+        
+        # Check for shortcuts at various levels
+        for fact in all_facts:
+            # 1-hop: person directly uses technology
+            if (f"{person} uses {answer}" in fact or 
+                f"{person} works with {answer}" in fact):
+                return False
+            # 2-hop: person's company uses technology
+            if company and (f"{company} uses {answer}" in fact):
+                return False
+            # 3-hop: person works on project directly
+            if project and (f"{person} works on {project}" in fact):
+                return False
+    
+    return True
+
 def generate_reasoning_chains(entities, num_chains=500):
     """Generate reasoning chains with shortcut validation"""
     chains = []
@@ -137,13 +248,15 @@ def generate_reasoning_chains(entities, num_chains=500):
     while len(chains) < num_chains and attempts < max_attempts:
         attempts += 1
         
-        # Determine chain type
-        if len(chains) < num_chains // 3:
+        # Determine chain type - now includes 4-hop
+        if len(chains) < num_chains // 4:
             chain_type = '1-hop'
-        elif len(chains) < 2 * num_chains // 3:
+        elif len(chains) < 2 * num_chains // 4:
             chain_type = '2-hop'
-        else:
+        elif len(chains) < 3 * num_chains // 4:
             chain_type = '3-hop'
+        else:
+            chain_type = '4-hop'
         
         # Generate potential chain
         potential_chain = None
@@ -265,6 +378,71 @@ def generate_reasoning_chains(entities, num_chains=500):
                     ],
                     'answer': location,
                     'reasoning_type': '3-hop'
+                }
+        
+        elif chain_type == '4-hop':
+            person = random.choice(entities['persons'])
+            
+            question_type = random.choice(['colleague_project_skill', 'manager_project_location', 'partner_project_technology'])
+            
+            if question_type == 'colleague_project_skill':
+                # What skill is needed for P001's colleague's company's project?
+                # P001 works_with P002 → P002 works_at C001 → C001 manages PR001 → PR001 requires S001
+                colleague = random.choice(entities['persons'])
+                company = random.choice(entities['companies'])
+                project = random.choice(entities['projects'])
+                skill = random.choice(entities['skills'])
+                
+                potential_chain = {
+                    'question': f"What skill is needed for {person}'s colleague's company's project?",
+                    'facts': [
+                        f"{person} works with {colleague}",
+                        f"{colleague} works at {company}",
+                        f"{company} manages {project}",
+                        f"{project} requires skill {skill}"
+                    ],
+                    'answer': skill,
+                    'reasoning_type': '4-hop'
+                }
+                
+            elif question_type == 'manager_project_location':
+                # Where is P001's manager's company's project located?
+                # P001 reports_to P002 → P002 works_at C001 → C001 manages PR001 → PR001 is_located_in L001
+                manager = random.choice(entities['persons'])
+                company = random.choice(entities['companies'])
+                project = random.choice(entities['projects'])
+                location = random.choice(entities['locations'])
+                
+                potential_chain = {
+                    'question': f"Where is {person}'s manager's company's project located?",
+                    'facts': [
+                        f"{person} reports to {manager}",
+                        f"{manager} works at {company}",
+                        f"{company} manages {project}",
+                        f"{project} is located in {location}"
+                    ],
+                    'answer': location,
+                    'reasoning_type': '4-hop'
+                }
+                
+            elif question_type == 'partner_project_technology':
+                # What technology is used in P001's company's partner's project?
+                # P001 works_at C001 → C001 partners_with C002 → C002 manages PR001 → PR001 uses_technology T001
+                company = random.choice(entities['companies'])
+                partner = random.choice(entities['companies'])
+                project = random.choice(entities['projects'])
+                technology = random.choice(entities['technologies'])
+                
+                potential_chain = {
+                    'question': f"What technology is used in {person}'s company's partner's project?",
+                    'facts': [
+                        f"{person} works at {company}",
+                        f"{company} partners with {partner}",
+                        f"{partner} manages {project}",
+                        f"{project} uses technology {technology}"
+                    ],
+                    'answer': technology,
+                    'reasoning_type': '4-hop'
                 }
         
         # Validate the potential chain

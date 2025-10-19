@@ -11,26 +11,34 @@ CONFIG = {
     
     # Document settings
     "DUP_RATE": 0.25,
-    "DOC_FACTS": 15,
-    "MIN_DOC_FACTS": 8,
-    "MAX_DOC_FACTS": 25,
+    "DOC_FACTS": 8,          # Reduced from 15 to 8
+    "MIN_DOC_FACTS": 5,      # Reduced from 8 to 5
+    "MAX_DOC_FACTS": 12,     # Reduced from 25 to 12
     
-    # Training settings - MUCH MORE CONSERVATIVE
+    # Training settings - MORE CONSERVATIVE
     "SEED": 42,
-    "BATCH_SIZE": 8,
-    "LEARNING_RATE": 1e-5,
+    "BATCH_SIZE": 8,              # Smaller batch size
+    "GRADIENT_ACCUMULATION": 4,   # Effective batch size = 16
+    "LEARNING_RATE": 2e-6,        # Much lower learning rate
     "NUM_EPOCHS": 10,
-    "MODEL_DIM": 256,          # Smaller model
-    "MODEL_LAYERS": 8,         # Fewer layers
+    "WARMUP_STEPS": 1000,          # Add warmup
+    "WEIGHT_DECAY": 0.01,
+    "MAX_GRAD_NORM": 1,         # Lower gradient clipping
+    
+    # Model architecture - CONSISTENT DIMENSIONS
+    "HIDDEN_SIZE": 768,           # Standard GPT2 size
+    "NUM_LAYERS": 6,
+    "NUM_HEADS": 12,              # Must divide HIDDEN_SIZE
+    "MAX_LENGTH": 512,
     "RETRIEVAL_K": 4,
     
-    # Model architecture
-    "HIDDEN_SIZE": 1024,
-    "NUM_LAYERS": 6,
-    "NUM_HEADS": 8,
-    "MAX_LENGTH": 512,
+    # Compatibility keys for model.py
+    "MODEL_DIM": 768,             # Same as HIDDEN_SIZE
+    "MODEL_LAYERS": 6,            # Same as NUM_LAYERS
+    "TRAIN_STEPS": 50000,         # For evaluation reporting
     
     # Data
-    "TOP_K_DOCS": 3,
+    "TOP_K_DOCS": 4,  # Reduced from 6 to 4 to fit within 512 tokens
     "MAX_FACTS_PER_DOC": 10,
+    "TRAIN_FROM_SCRATCH": True,  # Set to True to train from scratch
 }

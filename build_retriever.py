@@ -163,6 +163,8 @@ def test_oracle_retriever():
             test_questions.append(q)
         elif q['reasoning_type'] == '3-hop' and len(test_questions) == 1:
             test_questions.append(q)
+        elif q['reasoning_type'] == '4-hop' and len(test_questions) == 2:
+            test_questions.append(q)
             break
     
     for i, question_data in enumerate(test_questions):

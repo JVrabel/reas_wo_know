@@ -22,11 +22,11 @@ def run_step(script_name, description):
 
 if __name__ == "__main__":
     steps = [
-        ("create_data.py", "Creating synthetic knowledge base and QA pairs"),
-        ("build_retriever.py", "Building TF-IDF retriever and FAISS index"),
-        ("test_retriever.py", "Testing retriever quality"),
-        # ("train_reasoner.py", "Training the reasoning model"),
-        # ("eval.py", "Evaluating the complete system")
+        # ("create_data.py", "Creating synthetic knowledge base and QA pairs"),
+        # ("build_retriever.py", "Building TF-IDF retriever and FAISS index"),
+        # ("test_retrieval.py", "Testing retriever quality"),
+        ("train_reasoner.py", "Training the reasoning model"),
+        ("eval.py", "Evaluating the complete system")
     ]
     
     for script, desc in steps:

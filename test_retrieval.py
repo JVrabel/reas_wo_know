@@ -23,7 +23,8 @@ def test_retrieval_comprehensive(top_k=6):
     questions_by_type = {
         '1-hop': [],
         '2-hop': [],
-        '3-hop': []
+        '3-hop': [],
+        '4-hop': []
     }
     
     for q in all_questions:
@@ -33,12 +34,13 @@ def test_retrieval_comprehensive(top_k=6):
     
     print(f"Found questions: {len(questions_by_type['1-hop'])} 1-hop, "
           f"{len(questions_by_type['2-hop'])} 2-hop, "
-          f"{len(questions_by_type['3-hop'])} 3-hop")
+          f"{len(questions_by_type['3-hop'])} 3-hop, "
+          f"{len(questions_by_type['4-hop'])} 4-hop")
     
     # Test each reasoning type
     results = {}
     
-    for reasoning_type in ['1-hop', '2-hop', '3-hop']:
+    for reasoning_type in ['1-hop', '2-hop', '3-hop', '4-hop']:
         print(f"\n{'='*80}")
         print(f"TESTING {reasoning_type.upper()} QUESTIONS (top_k={top_k})")
         print(f"{'='*80}")
@@ -114,7 +116,7 @@ def test_retrieval_comprehensive(top_k=6):
     print("RETRIEVAL PERFORMANCE SUMMARY")
     print(f"{'='*80}")
     
-    for reasoning_type in ['1-hop', '2-hop', '3-hop']:
+    for reasoning_type in ['1-hop', '2-hop', '3-hop', '4-hop']:
         stats = results[reasoning_type]
         total_q = stats['total_questions']
         perfect = stats['perfect_retrieval']
